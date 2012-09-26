@@ -53,7 +53,6 @@ def extractData(func):
     def decorator(self, *args, **kwargs):
         d = defer.maybeDeferred(func, self, *args, **kwargs)
         d.addCallback(extract)
-        d.addErrback(handleKeyError)
         return d
     return decorator
 
