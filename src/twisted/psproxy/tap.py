@@ -1,27 +1,4 @@
-###############################################################################
-#   Copyright 2012, DroneD Project.
-#
-#   Licensed under the Apache License, Version 2.0 (the "License");
-#   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an "AS IS" BASIS,
-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#   See the License for the specific language governing permissions and
-#   limitations under the License.
-###############################################################################
-
-"""
-Support for creating a service that exposes system processes.
-"""
-
-__author__ = "Justin Venus <justin.venus@gmail.com>"
-
-#TODO/FIXME security!!!!!
-
+#!/usr/bin/twistd -y
 from twisted.cred import credentials, portal, strcred
 from twisted.python import usage, util
 from twisted.internet import defer
@@ -30,6 +7,7 @@ from twisted.plugin import IPlugin
 from twisted.spread import pb
 from twisted.psproxy import process
 from zope.interface import implements
+import time
 import copy
 import re
 
@@ -56,6 +34,10 @@ def extractData(func):
         return d
     return decorator
 
+@process.threaded
+def proc(pid):
+    return process.Process(pid)
+
 class ProcessRoot(pb.Root, object):
     """Provides the System Information Remote API"""
     ###########################################################################
@@ -64,11 +46,9 @@ class ProcessRoot(pb.Root, object):
     def remote_process_list(self):
         return self.server.process_cache.keys()
 
-    def remoteMessageReceived(self, *args, **kwargs):
-        """update process cache on message received."""
-        if not self.server.deferred.called:
-            self.server.scheduler()
-        return pb.Root.remoteMessageReceived(self, *args, **kwargs)
+#    def remoteMessageReceived(self, *args, **kwargs):
+#        x = self.server.scheduler()
+#        return pb.Root.remoteMessageReceived(self, *args, **kwargs)
 
     def remote_pid_exists(self, pid):
         return process.pid_exists(pid)
@@ -108,47 +88,81 @@ class ProcessRoot(pb.Root, object):
     # Process API is defined in this block
     ###########################################################################
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_connections(self, pid, kind='inet'):
-        return process.Process(pid).get_connections(kind=kind)
+        obj = yield proc(pid)
+        obj = yield obj.get_connections(kind=kind)
+        defer.returnValue(obj)
 
+    @defer.inlineCallbacks
     def remote_process_get_cpu_percent(self, pid, interval=0.1):
         return process.Process(pid).get_cpu_percent(interval=interval)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_cpu_times(self, pid):
-        return process.Process(pid).get_cpu_times()
+        obj = yield proc(pid)
+        obj = yield obj.get_cpu_times()
+        defer.returnValue(obj)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_io_counters(self, pid):
-        return process.Process(pid).get_io_counters()
+        obj = yield proc(pid)
+        obj = yield obj.get_io_counters()
+        defer.returnValue(obj)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_ionice(self, pid):
-        return process.Process(pid).get_ionice()
+        obj = yield proc(pid)
+        obj = yield obj.get_ionice()
+        defer.returnValue(obj)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_memory_info(self, pid):
-        return process.Process(pid).get_memory_info()
+        obj = yield proc(pid)
+        obj = yield obj.get_memory_info()
+        defer.returnValue(obj)
     
+    @defer.inlineCallbacks
     def remote_process_get_memory_percent(self, pid):
-        return process.Process(pid).get_memory_percent()
+        obj = yield proc(pid)
+        obj = yield obj.get_memory_percent()
+        defer.returnValue(obj)
 
+    @defer.inlineCallbacks
     def get_num_threads(self, pid):
-        return process.Process(pid).get_num_threads()
+        obj = yield proc(pid)
+        obj = yield obj.get_num_threads()
+        defer.returnValue(obj)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_open_files(self, pid):
-        return process.Process(pid).get_open_files()
+        obj = yield proc(pid)
+        obj = yield obj.get_open_files()
+        defer.returnValue(obj)
 
     @extractData
+    @defer.inlineCallbacks
     def remote_process_get_threads(self, pid):
-        return process.Process(pid).get_threads()
+        obj = yield proc(pid)
+        obj = yield obj.get_threads()
+        defer.returnValue(obj)
 
+    @defer.inlineCallbacks
     def remote_process_getcwd(self, pid):
-        return process.Process(pid).getcwd()
+        obj = yield proc(pid)
+        obj = yield obj.getcwd()
+        defer.returnValue(obj)
 
+    @defer.inlineCallbacks
     def remote_process_is_running(self, pid):
-        return process.Process(pid).is_running()
+        obj = yield proc(pid)
+        obj = yield obj.is_running()
+        defer.returnValue(obj)
 
 #provide a convienent way to look up the server resource from the root.
 ProcessRoot = type(
@@ -159,8 +173,9 @@ class ProcessServer(internet.TCPServer, object):
     deferred = property(lambda s: s._deferred)
     def __init__(self, *args, **kwargs):
         internet.TCPServer.__init__(self, *args, **kwargs)
-        self._deferred = defer.succeed(None)
+        self._deferred = defer.succeed({})
         self.scheduler() #preload cache
+        self.timestamp = 0
 
     def scheduler(self):
         if self._deferred.called:
