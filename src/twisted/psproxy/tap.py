@@ -1,12 +1,10 @@
 #!/usr/bin/twistd -y
 from twisted.cred import credentials, portal, strcred
-from twisted.python import usage, util
-from twisted.internet import defer
-from twisted.application import internet, service
-from twisted.plugin import IPlugin
+from twisted.python import usage, util, failure
+from twisted.internet import defer, task
+from twisted.application import internet
 from twisted.spread import pb
 from twisted.psproxy import process
-from zope.interface import implements
 import time
 import copy
 import re
@@ -28,9 +26,13 @@ def extractData(func):
         if hasattr(result, '__dict__'):
             return dict(result.__dict__)
         return result
+    def extractFailure(reason):
+        return failure.Failure(
+            pb.RemoteError(reason.type, reason.value, reason.printTraceback))
     def decorator(self, *args, **kwargs):
         d = defer.maybeDeferred(func, self, *args, **kwargs)
         d.addCallback(extract)
+        d.addErrback(extractFailure)
         return d
     return decorator
 
@@ -43,13 +45,14 @@ class ProcessRoot(pb.Root, object):
     ###########################################################################
     # System Wide API is defined in this block
     ###########################################################################
+    def proc(self, pid):
+        return self.server.process_cache[pid]
+
+    @extractData
     def remote_process_list(self):
         return self.server.process_cache.keys()
 
-#    def remoteMessageReceived(self, *args, **kwargs):
-#        x = self.server.scheduler()
-#        return pb.Root.remoteMessageReceived(self, *args, **kwargs)
-
+    @extractData
     def remote_pid_exists(self, pid):
         return process.pid_exists(pid)
 
@@ -73,111 +76,122 @@ class ProcessRoot(pb.Root, object):
     def remote_network_io_counters(self, pernic=False):
         return process.network_io_counters(pernic=pernic)
 
-    @defer.inlineCallbacks
+    @extractData
     def remote_find_processes(self, regex='.*'):
         regex = re.compile(regex)
-        possible = yield self.server.scheduler()
         result = []
-        for var, val in possible.items():
+        for var, val in self.server.process_cache.items():
             try:
                 if regex.search(' '.join(val.cmdline)):
                     result.append(var) 
             except: continue
-        defer.returnValue(result)
+        return result
     ###########################################################################
     # Process API is defined in this block
     ###########################################################################
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_connections(self, pid, kind='inet'):
-        obj = yield proc(pid)
-        obj = yield obj.get_connections(kind=kind)
-        defer.returnValue(obj)
+        return proc(pid).addCallback(
+            lambda x: x.get_connections(kind=kind))
 
-    @defer.inlineCallbacks
+    @extractData
     def remote_process_get_cpu_percent(self, pid, interval=0.1):
-        return process.Process(pid).get_cpu_percent(interval=interval)
+        return proc(pid).addCallback(
+            lambda x: x.get_cpu_percent(interval=interval))
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_cpu_times(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_cpu_times()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_cpu_times())
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_io_counters(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_io_counters()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_io_counters())
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_ionice(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_ionice()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_ionice())
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_memory_info(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_memory_info()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_memory_info())
     
-    @defer.inlineCallbacks
+    @extractData
     def remote_process_get_memory_percent(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_memory_percent()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_memory_percent())
 
-    @defer.inlineCallbacks
+    @extractData
     def get_num_threads(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_num_threads()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_num_threads())
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_open_files(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_open_files()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_open_files())
 
     @extractData
-    @defer.inlineCallbacks
     def remote_process_get_threads(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.get_threads()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.get_threads())
 
-    @defer.inlineCallbacks
+    @extractData
     def remote_process_getcwd(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.getcwd()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.getcwd())
 
-    @defer.inlineCallbacks
+    @extractData
     def remote_process_is_running(self, pid):
-        obj = yield proc(pid)
-        obj = yield obj.is_running()
-        defer.returnValue(obj)
+        return proc(pid).addCallback(lambda x: x.is_running())
 
 #provide a convienent way to look up the server resource from the root.
 ProcessRoot = type(
     'ProcessRoot', (ProcessRoot,), {'server': property(lambda s: SERVICE)})
 
+
+def synchronizedDeferred(lock):
+    """The function will run with the given lock acquired"""
+    #make sure we are given an acquirable/releasable object
+    assert isinstance(lock, (defer.DeferredLock, defer.DeferredSemaphore))
+    def decorator(func):
+        """Takes a function that will aquire a lock, execute the function, 
+           and release the lock.  Control will then be returned to the 
+           reactor for err/callbacks to run.
+  
+           returns deferred
+        """
+        def newfunc(*args,**kwargs):
+            return lock.run(func,*args,**kwargs)
+        return newfunc
+    return decorator
+
+
 class ProcessServer(internet.TCPServer, object):
+    Lock = defer.DeferredLock()
+    factory = None
     process_cache = {}
     deferred = property(lambda s: s._deferred)
     def __init__(self, *args, **kwargs):
+        self.interval = kwargs.pop("interval")
         internet.TCPServer.__init__(self, *args, **kwargs)
         self._deferred = defer.succeed({})
-        self.scheduler() #preload cache
-        self.timestamp = 0
+        self._task = task.LoopingCall(self.scheduler)
+        self._task.start(self.interval)
+
+    @synchronizedDeferred(Lock)
+    def _restartTask(self):
+        if self._task.running:
+            self._task.stop()
+        self._task.start(self.interval)
+        from twisted.internet import reactor
+        d = defer.Deferred()
+        reactor.callLater(self.interval/2.0, d.callback, None)
+        return d #silly hack to spread out re-scans
+
+    def restartTask(self):
+        if self.Lock.locked or not self.deferred.called:
+            return defer.succeed(None)
+        return self._restartTask()
 
     def scheduler(self):
+        if hasattr(self.factory, 'allConnections'):
+            if not self.factory.allConnections:
+                return defer.succeed(self.process_cache)
         if self._deferred.called:
             self._deferred = self._process_scanner()
             self._deferred.addCallback(self._updateState)
@@ -190,11 +204,21 @@ class ProcessServer(internet.TCPServer, object):
     @process.threaded
     def _process_scanner(self):
         results = {}
-        for proc in process.process_iter():
+        for p in process.process_iter():
             try:
-                results.update({proc.pid: proc})
+                results.update({p.pid: p})
             except: continue
         return results
+
+
+class NotifyingPBServerFactory(pb.PBServerFactory):
+    allConnections = set()
+    def buildProtocol(self, addr):
+        protocol = pb.PBServerFactory.buildProtocol(self, addr)
+        protocol.notifyOnConnect(lambda: self.allConnections.add(addr)) 
+        protocol.notifyOnConnect(self.server.restartTask)
+        protocol.notifyOnDisconnect(lambda: self.allConnections.discard(addr))
+        return protocol
 
 
 class Options(usage.Options, strcred.AuthOptionMixin):
@@ -202,11 +226,15 @@ class Options(usage.Options, strcred.AuthOptionMixin):
     optParameters = [
         ["port", "p", 666, "Server port number", usage.portCoerce],
         ["host", "h", "localhost", "Server hostname"],
+        ["interval", "", 15, "Interval to scan processes", float],
     ]
 
 
 def makeService(options):
     global SERVICE
-    factory = pb.PBServerFactory(ProcessRoot())
-    SERVICE = ProcessServer(options["port"], factory)
+    factory = NotifyingPBServerFactory(ProcessRoot())
+    SERVICE = ProcessServer(
+        options["port"], factory, interval=options["interval"])
+    factory.server = SERVICE
+    SERVICE.factory = factory
     return SERVICE

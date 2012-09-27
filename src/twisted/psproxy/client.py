@@ -1,4 +1,5 @@
 from twisted.internet import defer
+from twisted.python import failure
 from twisted.spread import pb
 
 _machine_methods = [
@@ -103,7 +104,9 @@ if __name__ == '__main__':
                 x = yield Process(pid, agent).get_connections()
                 if not x: continue
                 println(x)
-            except: traceback.print_exc()
+            except:
+                traceback.print_exc()
+        #        break
 
     def test():
         d = _test()
